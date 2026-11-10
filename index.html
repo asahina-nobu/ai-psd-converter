@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI / PSD コンバーター</title>
+<style>
+  :root {
+    --bg: #f6f6f4; --surface: #ffffff; --text: #1d1d1b; --muted: #6b6b66;
+    --border: #d8d8d2; --accent: #2b59c3; --accent-text: #ffffff;
+    --ok: #1d7a3f; --ng: #b3261e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161615; --surface: #20201f; --text: #ecece8; --muted: #9a9a94;
+      --border: #3a3a37; --accent: #6b92ee; --accent-text: #0e1220;
+      --ok: #5fcf8a; --ng: #f2877f;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font-family: system-ui, "Hiragino Sans", "Yu Gothic UI", Meiryo, sans-serif; line-height: 1.6; }
+  main { max-width: 760px; margin: 0 auto; padding: 32px 16px 64px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 14px; margin: 0 0 24px; }
+  .options { display: flex; gap: 16px; align-items: center; margin-bottom: 16px; font-size: 14px; flex-wrap: wrap; }
+  .options label { cursor: pointer; }
+  #drop { border: 2px dashed var(--border); border-radius: 12px; background: var(--surface);
+    padding: 48px 16px; text-align: center; cursor: pointer; transition: border-color .15s, background .15s; }
+  #drop.over { border-color: var(--accent); }
+  #drop strong { display: block; font-size: 17px; margin-bottom: 4px; }
+  #drop span { color: var(--muted); font-size: 13px; }
+  #list { list-style: none; padding: 0; margin: 24px 0 0; display: grid; gap: 8px; }
+  .item { display: flex; align-items: center; gap: 12px; background: var(--surface);
+    border: 1px solid var(--border); border-radius: 10px; padding: 10px 14px; }
+  .item .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
+  .item .msg { font-size: 12px; color: var(--muted); }
+  .item .status { font-size: 13px; font-weight: 600; }
+  .ok { color: var(--ok); } .ng { color: var(--ng); }
+  .item a, .item button.dl { background: var(--accent); color: var(--accent-text); text-decoration: none;
+    border: 0; border-radius: 8px; padding: 6px 12px; font-size: 13px; cursor: pointer; white-space: nowrap; }
+  .note { margin-top: 32px; font-size: 12px; color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1>AI / PSD コンバーター</h1>
+  <p class="sub">ファイルはこのブラウザの中だけで処理され、外部には送信されません。</p>
+
+  <div class="options">
+    <span>PSDの変換先:</span>
+    <label><input type="radio" name="psdfmt" value="png" checked> PNG</label>
+    <label><input type="radio" name="psdfmt" value="pdf"> PDF</label>
+  </div>
+
+  <div id="drop" tabindex="0">
+    <strong>ここに .ai / .psd ファイルをドロップ</strong>
+    <span>クリックして選択もできます(複数可) / .ai → PDF、.psd → PNG または PDF</span>
+  </div>
+  <input id="file" type="file" accept=".ai,.psd" multiple hidden>
+
+  <ul id="list"></ul>
+
+  <p class="note">
+    .ai は「PDF互換ファイルを作成」を有効にして保存されたもののみ変換できます(Illustratorの既定設定)。
+    .psd は「互換性を優先」を有効にして保存されたもののみ変換できます。
+  </p>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/ag-psd@28.2.2/dist/bundle.js"></script>
+<script>
+const drop = document.getElementById('drop');
+const input = document.getElementById('file');
+const list = document.getElementById('list');
+
+drop.addEventListener('click', () => input.click());
+drop.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') input.click(); });
+input.addEventListener('change', () => { handleFiles(input.files); input.value = ''; });
+['dragenter', 'dragover'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('over'); }));
+['dragleave', 'drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('over'); }));
+drop.addEventListener('drop', e => handleFiles(e.dataTransfer.files));
+// ページのどこにドロップしてもブラウザがファイルを開かないようにする
+window.addEventListener('dragover', e => e.preventDefault());
+window.addEventListener('drop', e => e.preventDefault());
+
+function psdFormat() {
+  return document.querySelector('input[name="psdfmt"]:checked').value;
+}
+
+function addItem(name) {
+  const li = document.createElement('li');
+  li.className = 'item';
+  li.innerHTML = '<div class="name"></div><div class="status">変換中…</div>';
+  li.querySelector('.name').textContent = name;
+  list.prepend(li);
+  return li;
+}
+
+function finish(li, ok, msg, blob, outName) {
+  const status = li.querySelector('.status');
+  status.className = 'status ' + (ok ? 'ok' : 'ng');
+  status.textContent = ok ? '完了' : '失敗';
+  const name = li.querySelector('.name');
+  const m = document.createElement('div');
+  m.className = 'msg';
+  m.textContent = msg;
+  name.appendChild(m);
+  if (ok && blob) {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = outName;
+    a.textContent = 'ダウンロード';
+    li.appendChild(a);
+    a.click(); // 自動でも保存を開始
+  }
+}
+
+async function handleFiles(files) {
+  for (const file of files) {
+    const li = addItem(file.name);
+    const ext = file.name.split('.').pop().toLowerCase();
+    const base = file.name.replace(/\.[^.]+$/, '');
+    try {
+      if (ext === 'ai') {
+        await convertAi(file, base, li);
+      } else if (ext === 'psd') {
+        await convertPsd(file, base, li);
+      } else {
+        finish(li, false, '.ai か .psd のファイルを指定してください。');
+      }
+    } catch (err) {
+      console.error(err);
+      finish(li, false, '予期しないエラー: ' + (err && err.message ? err.message : err));
+    }
+  }
+}
+
+// .ai → .pdf : PDF互換データを含むファイルは、そのままPDFとして取り出せる
+async function convertAi(file, base, li) {
+  const head = new Uint8Array(await file.slice(0, 1024).arrayBuffer());
+  const text = new TextDecoder('latin1').decode(head);
+  if (text.includes('%PDF-')) {
+    const blob = new Blob([file], { type: 'application/pdf' });
+    finish(li, true, 'PDF互換データを検出し、そのままPDFとして保存しました。', blob, base + '.pdf');
+  } else {
+    finish(li, false, 'PDF互換データがありません。Illustratorで「PDF互換ファイルを作成」を有効にして保存し直してください。');
+  }
+}
+
+// .psd → .png / .pdf : 合成済み画像を取り出して変換する
+async function convertPsd(file, base, li) {
+  if (typeof agPsd === 'undefined') {
+    finish(li, false, 'PSD読み込みライブラリを取得できませんでした。ネットワーク接続を確認してください。');
+    return;
+  }
+  const buf = await file.arrayBuffer();
+  const psd = agPsd.readPsd(buf, { skipLayerImageData: true, skipThumbnail: true });
+  const canvas = psd.canvas;
+  if (!canvas) {
+    finish(li, false, '合成画像が含まれていません。Photoshopで「互換性を優先」を有効にして保存し直してください。');
+    return;
+  }
+  const pngBlob = await new Promise(res => canvas.toBlob(res, 'image/png'));
+  if (!pngBlob) {
+    finish(li, false, '画像サイズが大きすぎてPNGに変換できませんでした。');
+    return;
+  }
+  if (psdFormat() === 'png') {
+    finish(li, true, canvas.width + ' × ' + canvas.height + ' px のPNGに変換しました。', pngBlob, base + '.png');
+    return;
+  }
+  const { PDFDocument } = PDFLib;
+  const pdf = await PDFDocument.create();
+  const img = await pdf.embedPng(await pngBlob.arrayBuffer());
+  const page = pdf.addPage([img.width, img.height]);
+  page.drawImage(img, { x: 0, y: 0, width: img.width, height: img.height });
+  const bytes = await pdf.save();
+  finish(li, true, canvas.width + ' × ' + canvas.height + ' px のPDFに変換しました。', new Blob([bytes], { type: 'application/pdf' }), base + '.pdf');
+}
+</script>
+</body>
+</html>
