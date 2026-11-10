@@ -63,12 +63,11 @@
 
   <p class="note">
     .ai は「PDF互換ファイルを作成」を有効にして保存されたもののみ変換できます(Illustratorの既定設定)。
-    .psd は「互換性を優先」を有効にして保存されたもののみ変換できます。
+    .psd は「互換性を優先」を有効にして保存されたもののみ変換できます(RGB / CMYK / グレースケールに対応)。
   </p>
 </main>
 
 <script src="https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/ag-psd@28.2.2/dist/bundle.js"></script>
 <script>
 const drop = document.getElementById('drop');
 const input = document.getElementById('file');
@@ -148,35 +147,138 @@ async function convertAi(file, base, li) {
   }
 }
 
+// PSDPARSER-BEGIN
+// PSDの末尾にある「合成済み画像」だけを直接読む(レイヤーは解析しないので高速)。
+// 対応: グレースケール / RGB / CMYK、8bit / 16bit、非圧縮 / RLE圧縮
+function psdToRgba(buf) {
+  const dv = new DataView(buf);
+  const u8 = new Uint8Array(buf);
+  if (buf.byteLength < 30 || dv.getUint32(0) !== 0x38425053) throw new Error('PSDファイルではありません。');
+  if (dv.getUint16(4) !== 1) throw new Error('PSB(大判形式)には未対応です。');
+  const channels = dv.getUint16(12);
+  const height = dv.getUint32(14);
+  const width = dv.getUint32(18);
+  const depth = dv.getUint16(22);
+  const mode = dv.getUint16(24);
+
+  const need = { 1: 1, 3: 3, 4: 4 }[mode];
+  if (!need) throw new Error('未対応のカラーモードです(モード番号 ' + mode + ')。Photoshopで RGB に変換して保存し直してください。');
+  if (depth !== 8 && depth !== 16) throw new Error(depth + 'bit には未対応です。8bit または 16bit で保存し直してください。');
+  if (channels < need) throw new Error('チャンネル数が不足しています。');
+  const bps = depth / 8;
+
+  let pos = 26;
+  for (let i = 0; i < 3; i++) {            // カラーモード情報 / 画像リソース / レイヤー情報 を読み飛ばす
+    if (pos + 4 > buf.byteLength) throw new Error('ファイルが壊れているか、途中で切れています。');
+    pos += 4 + dv.getUint32(pos);
+  }
+  if (pos + 2 > buf.byteLength) throw new Error('合成画像のデータが見つかりません。');
+  const comp = dv.getUint16(pos); pos += 2;
+
+  const planeSize = width * height;
+  const planes = [];
+  for (let c = 0; c < need; c++) planes.push(new Uint8Array(planeSize));
+
+  if (comp === 0) {                         // 非圧縮
+    const chBytes = planeSize * bps;
+    if (pos + chBytes * need > buf.byteLength) throw new Error('画像データが途中で切れています。');
+    for (let c = 0; c < need; c++) {
+      const base = pos + c * chBytes;
+      const plane = planes[c];
+      if (bps === 1) plane.set(u8.subarray(base, base + planeSize));
+      else for (let i = 0; i < planeSize; i++) plane[i] = u8[base + i * 2];   // 16bit は上位バイトを使う
+    }
+  } else if (comp === 1) {                  // RLE(PackBits)
+    let tab = pos;
+    pos += channels * height * 2;           // 行ごとのバイト数テーブルは全チャンネル分ある
+    const rowBytes = width * bps;
+    const row = new Uint8Array(rowBytes);
+    for (let c = 0; c < need; c++) {
+      const plane = planes[c];
+      for (let y = 0; y < height; y++) {
+        const rowLen = dv.getUint16(tab); tab += 2;
+        const end = pos + rowLen;
+        if (end > buf.byteLength) throw new Error('画像データが途中で切れています。');
+        let i = pos, o = 0;
+        while (o < rowBytes && i < end) {
+          const n = u8[i++];
+          if (n < 128) {
+            const len = Math.min(n + 1, rowBytes - o);
+            row.set(u8.subarray(i, i + len), o);
+            i += n + 1; o += len;
+          } else if (n > 128) {
+            const len = Math.min(257 - n, rowBytes - o);
+            row.fill(u8[i++], o, o + len);
+            o += len;
+          }
+        }
+        pos = end;
+        const off = y * width;
+        if (bps === 1) plane.set(row, off);
+        else for (let x = 0; x < width; x++) plane[off + x] = row[x * 2];
+      }
+    }
+  } else {
+    throw new Error('未対応の圧縮形式です(' + comp + ')。');
+  }
+
+  const rgba = new Uint8ClampedArray(planeSize * 4);
+  if (mode === 1) {
+    const g = planes[0];
+    for (let i = 0, j = 0; i < planeSize; i++, j += 4) { rgba[j] = rgba[j + 1] = rgba[j + 2] = g[i]; rgba[j + 3] = 255; }
+  } else if (mode === 3) {
+    const [r, g, b] = planes;
+    for (let i = 0, j = 0; i < planeSize; i++, j += 4) { rgba[j] = r[i]; rgba[j + 1] = g[i]; rgba[j + 2] = b[i]; rgba[j + 3] = 255; }
+  } else {                                  // CMYK: Photoshopは値を反転して保存(255 = インクなし)
+    const [c, m, y, k] = planes;
+    for (let i = 0, j = 0; i < planeSize; i++, j += 4) {
+      const kk = k[i];
+      rgba[j] = (c[i] * kk) / 255;
+      rgba[j + 1] = (m[i] * kk) / 255;
+      rgba[j + 2] = (y[i] * kk) / 255;
+      rgba[j + 3] = 255;
+    }
+  }
+  return { width, height, rgba, mode };
+}
+// PSDPARSER-END
+
 // .psd → .png / .pdf : 合成済み画像を取り出して変換する
 async function convertPsd(file, base, li) {
-  if (typeof agPsd === 'undefined') {
-    finish(li, false, 'PSD読み込みライブラリを取得できませんでした。ネットワーク接続を確認してください。');
-    return;
-  }
   const buf = await file.arrayBuffer();
-  const psd = agPsd.readPsd(buf, { skipLayerImageData: true, skipThumbnail: true });
-  const canvas = psd.canvas;
-  if (!canvas) {
-    finish(li, false, '合成画像が含まれていません。Photoshopで「互換性を優先」を有効にして保存し直してください。');
+  let img;
+  try {
+    img = psdToRgba(buf);
+  } catch (err) {
+    finish(li, false, err.message);
     return;
   }
+  const canvas = document.createElement('canvas');
+  canvas.width = img.width;
+  canvas.height = img.height;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) {
+    finish(li, false, '画像サイズが大きすぎて処理できませんでした。');
+    return;
+  }
+  ctx.putImageData(new ImageData(img.rgba, img.width, img.height), 0, 0);
   const pngBlob = await new Promise(res => canvas.toBlob(res, 'image/png'));
   if (!pngBlob) {
     finish(li, false, '画像サイズが大きすぎてPNGに変換できませんでした。');
     return;
   }
+  const cmykNote = img.mode === 4 ? '(CMYK→RGBは簡易変換のため、色味が少し異なる場合があります)' : '';
   if (psdFormat() === 'png') {
-    finish(li, true, canvas.width + ' × ' + canvas.height + ' px のPNGに変換しました。', pngBlob, base + '.png');
+    finish(li, true, img.width + ' × ' + img.height + ' px のPNGに変換しました。' + cmykNote, pngBlob, base + '.png');
     return;
   }
   const { PDFDocument } = PDFLib;
   const pdf = await PDFDocument.create();
-  const img = await pdf.embedPng(await pngBlob.arrayBuffer());
-  const page = pdf.addPage([img.width, img.height]);
-  page.drawImage(img, { x: 0, y: 0, width: img.width, height: img.height });
+  const png = await pdf.embedPng(await pngBlob.arrayBuffer());
+  const page = pdf.addPage([png.width, png.height]);
+  page.drawImage(png, { x: 0, y: 0, width: png.width, height: png.height });
   const bytes = await pdf.save();
-  finish(li, true, canvas.width + ' × ' + canvas.height + ' px のPDFに変換しました。', new Blob([bytes], { type: 'application/pdf' }), base + '.pdf');
+  finish(li, true, img.width + ' × ' + img.height + ' px のPDFに変換しました。' + cmykNote, new Blob([bytes], { type: 'application/pdf' }), base + '.pdf');
 }
 </script>
 </body>
